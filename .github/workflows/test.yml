@@ -1,0 +1,22 @@
+name: Package checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Validate VBS launchers
+        shell: powershell
+        run: .\.github\scripts\Test-VbsLaunchers.ps1
+      - name: Validate PowerShell and package
+        shell: powershell
+        run: .\tools\Test-Package.ps1

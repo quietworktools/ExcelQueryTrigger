@@ -1,0 +1,221 @@
+name: Publish release package
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish (for example 0.9.5 or 0.10)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Validate VBS launchers
+        shell: powershell
+        run: .\.github\scripts\Test-VbsLaunchers.ps1
+
+      - name: Validate source package
+        shell: powershell
+        run: .\tools\Test-Package.ps1
+
+      - name: Validate requested version
+        shell: powershell
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          $requested = $env:REQUESTED_VERSION
+          $common = Get-Content -LiteralPath '.\src\Common.ps1' -Raw
+
+          if ($common -notmatch "AppVersion\s*=\s*'([^']+)'") {
+            throw 'AppVersion was not found.'
+          }
+
+          $sourceVersion = $Matches[1]
+
+          if ($requested -notmatch '^\d+\.\d+(?:\.\d+)?$') {
+            throw "Invalid version: $requested"
+          }
+
+          if ($sourceVersion -ne $requested) {
+            throw "src/Common.ps1 is $sourceVersion but requested version is $requested."
+          }
+
+          "VERSION=$requested" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Refuse existing release
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "v$env:VERSION"
+
+          cmd /c "gh release view $tag --repo $env:GITHUB_REPOSITORY >NUL 2>NUL"
+          $releaseExists = ($LASTEXITCODE -eq 0)
+          $global:LASTEXITCODE = 0
+
+          if ($releaseExists) {
+            throw "Release $tag already exists. Bump the version instead."
+          }
+
+          Write-Host "Release $tag does not exist. Safe to continue."
+
+      - name: Build release ZIP
+        shell: powershell
+        run: |
+          $version = $env:VERSION
+          $folderName = 'ExcelQueryTrigger-v' + ($version -replace '\.', '_')
+          $stage = Join-Path $env:RUNNER_TEMP $folderName
+
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+          $include = @(
+            'assets',
+            'config\rules.json',
+            'docs',
+            'src',
+            'tools',
+            'ExcelQueryTrigger.ps1',
+            'INSTRUCTION_EN.md',
+            'INSTRUCTION_JA.md',
+            'README.md',
+            'RELEASE-NOTES.md',
+            'Setup.cmd',
+            'Start-AtLogon.vbs',
+            'Start-Hidden.vbs'
+          )
+
+          foreach ($item in $include) {
+            $source = Join-Path $PWD $item
+
+            if (-not (Test-Path -LiteralPath $source)) {
+              throw "Required release item is missing: $item"
+            }
+
+            $destination = Join-Path $stage $item
+
+            if (Test-Path -LiteralPath $source -PathType Container) {
+              Copy-Item `
+                -LiteralPath $source `
+                -Destination $destination `
+                -Recurse `
+                -Force
+            }
+            else {
+              $destinationDirectory = Split-Path -Parent $destination
+              if (-not (Test-Path -LiteralPath $destinationDirectory)) {
+                New-Item `
+                  -ItemType Directory `
+                  -Force `
+                  -Path $destinationDirectory | Out-Null
+              }
+
+              Copy-Item `
+                -LiteralPath $source `
+                -Destination $destination `
+                -Force
+            }
+          }
+
+          # Development-only test file is not part of the end-user package.
+          Remove-Item `
+            -LiteralPath (Join-Path $stage 'tools\Test-Package.ps1') `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+          $zip = Join-Path $PWD ("ExcelQueryTrigger-v{0}.zip" -f $version)
+
+          if (Test-Path -LiteralPath $zip) {
+            Remove-Item -LiteralPath $zip -Force
+          }
+
+          Compress-Archive `
+            -Path $stage `
+            -DestinationPath $zip `
+            -Force
+
+          $hash = (
+            Get-FileHash -LiteralPath $zip -Algorithm SHA256
+          ).Hash.ToLowerInvariant()
+
+          "$hash  $(Split-Path -Leaf $zip)" |
+            Set-Content `
+              -LiteralPath 'SHA256SUMS.txt' `
+              -Encoding ascii
+
+          Write-Host "Release asset: $(Split-Path -Leaf $zip)"
+          Write-Host "SHA-256: $hash"
+
+      - name: Prepare release notes
+        shell: powershell
+        run: |
+          $version = $env:VERSION
+          $lines = Get-Content -LiteralPath '.\RELEASE-NOTES.md'
+
+          $start = $lines |
+            Select-String -SimpleMatch "v$version" |
+            Select-Object -First 1
+
+          if ($null -eq $start) {
+            "Excel Query Trigger Manager v$version" |
+              Set-Content `
+                -LiteralPath 'release-notes.txt' `
+                -Encoding utf8
+          }
+          else {
+            $next = $lines |
+              Select-String -Pattern '^##\s+v\d' |
+              Where-Object { $_.LineNumber -gt $start.LineNumber } |
+              Select-Object -First 1
+
+            $endIndex = if ($null -eq $next) {
+              $lines.Count - 1
+            }
+            else {
+              $next.LineNumber - 2
+            }
+
+            $lines[($start.LineNumber - 1)..$endIndex] |
+              Set-Content `
+                -LiteralPath 'release-notes.txt' `
+                -Encoding utf8
+          }
+
+      - name: Publish release
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "v$env:VERSION"
+          $asset = "ExcelQueryTrigger-v$env:VERSION.zip"
+
+          if (-not (Test-Path -LiteralPath $asset)) {
+            throw "Release ZIP was not created: $asset"
+          }
+
+          if (-not (Test-Path -LiteralPath 'SHA256SUMS.txt')) {
+            throw 'SHA256SUMS.txt was not created.'
+          }
+
+          gh release create `
+            $tag `
+            $asset `
+            SHA256SUMS.txt `
+            --repo $env:GITHUB_REPOSITORY `
+            --title $tag `
+            --notes-file release-notes.txt
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to create release $tag."
+          }
+
+          Write-Host "Published release $tag."

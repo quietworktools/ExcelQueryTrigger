@@ -1,0 +1,30 @@
+{
+    "rules": [],
+    "appSettings": {
+        "startWithWindows": false,
+        "startMinimized": true,
+        "minimizeToTray": true,
+        "showSuccessNotifications": true,
+        "showErrorNotifications": true,
+        "showTriggerNotifications": false,
+        "uiFontSize": 9,
+        "startupPromptDelaySeconds": 30,
+        "scheduleCheckSeconds": 30,
+        "watcherHealthCheckSeconds": 60,
+        "defaultDebounceSeconds": 5,
+        "defaultCooldownSeconds": 30,
+        "logRetentionDays": 30,
+        "logMaxTotalMegabytes": 50,
+        "debugLogging": false,
+        "coalesceDuplicateWorkbooks": true,
+        "rulesPaneMode": "Compact",
+        "checkForUpdatesAutomatically": true,
+        "lastUpdateCheckUtc": "",
+        "enginePollMilliseconds": 500,
+        "uiRefreshMilliseconds": 500,
+        "defaultRefreshWarningSeconds": 300,
+        "allowWorkbookMacrosByDefault": false,
+        "showTriggeredResultPopup": true
+    },
+    "schemaVersion": 4
+}

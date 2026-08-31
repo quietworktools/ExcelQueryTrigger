@@ -1,0 +1,8 @@
+logs/
+config/rules.json.bak
+config/state.json
+config/welcome-seen.txt
+config/history.jsonl
+config/*.tmp
+
+.DS_Store
