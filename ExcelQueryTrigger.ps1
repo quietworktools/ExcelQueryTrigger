@@ -59,9 +59,51 @@ if ([string]::IsNullOrWhiteSpace($appRoot)) { $appRoot = Split-Path -Parent $MyI
 # asks the existing UI instance to restore its Dashboard from the tray. This
 # also makes it obvious when a hidden PowerShell host is genuinely stuck inside
 # an Excel COM call: a healthy UI acknowledges the request within 1.5 seconds.
+#
+# A launch that came from Windows sign-in carries information the running
+# instance cannot recover on its own. If the user happened to start the
+# application by hand a second or two before Start-AtLogon.vbs ran, the logon
+# launch loses the mutex race and used to exit having told nobody that a real
+# sign-in occurred - so the At Logon rules silently never fired. The same
+# named-event mechanism that reopens the Dashboard carries that fact across.
 $instanceMutexName       = 'Local\ExcelQueryTriggerSingleInstance'
 $activateEventName       = 'Local\ExcelQueryTriggerActivateExisting'
 $activateAckEventName    = 'Local\ExcelQueryTriggerActivateAcknowledged'
+$logonIntentEventName    = 'Local\ExcelQueryTriggerLogonIntent'
+$logonIntentAckEventName = 'Local\ExcelQueryTriggerLogonIntentAcknowledged'
+
+# ---- open the logon hand-over channel BEFORE the mutex ----------------------
+# A named event exists only while at least one handle is open, so whoever ends
+# up signalling it must never be its only owner. Opening these after the mutex
+# leaves a window - however small - in which the primary can be descheduled
+# (ordinary scheduling, AV/EDR inspection, a slow disk) while a secondary
+# creates, signals, times out and closes the last handle, destroying the object
+# before the primary ever sees it.
+#
+# Doing it here removes the dependency on timing altogether. Every process,
+# primary or not, holds both handles before the mutex decides who won. A
+# secondary therefore cannot exist as the sole owner of a signalled LogonIntent
+# once it has discovered a primary: the primary it discovered was already
+# holding a handle when the mutex answered.
+#
+# Failure is not fatal. The application runs; only the hand-over is lost, and
+# that is reported once LogManager exists. Set-StrictMode -Version 1.0 throws
+# on reading an unassigned variable, so this must be initialized on every path.
+$logonIntentEvent = $null
+$logonIntentAckEvent = $null
+$script:LogonIntentInitError = ''
+try {
+    $logonIntentEvent = New-Object System.Threading.EventWaitHandle(
+        $false, [System.Threading.EventResetMode]::AutoReset, $logonIntentEventName)
+    $logonIntentAckEvent = New-Object System.Threading.EventWaitHandle(
+        $false, [System.Threading.EventResetMode]::AutoReset, $logonIntentAckEventName)
+}
+catch {
+    $logonIntentEvent = $null
+    $logonIntentAckEvent = $null
+    $script:LogonIntentInitError = $_.Exception.Message
+}
+
 $instanceMutex = New-Object System.Threading.Mutex($false, $instanceMutexName)
 $ownsInstanceMutex = $false
 try {
@@ -75,6 +117,38 @@ catch [System.Threading.AbandonedMutexException] {
 }
 
 if (-not $ownsInstanceMutex) {
+
+    # ---- a logon launch that lost the race ----------------------------------
+    # Hand the sign-in over to the primary instance and leave. This path stays
+    # completely silent: Windows started us, the user did not, so there is no
+    # window to reopen and no dialog that would be welcome at sign-in. It is
+    # also deliberately separate from the activation handshake - a logon start
+    # must never pop the Dashboard in front of whatever the user is doing.
+    if ($StartedFromLogon) {
+        try {
+            # The handles were opened before the mutex, so they are already
+            # shared with the primary this process just discovered. Nothing is
+            # created here, and the object cannot vanish when this process
+            # exits.
+            if ($null -ne $logonIntentEvent -and $null -ne $logonIntentAckEvent) {
+                [void]$logonIntentAckEvent.Reset()
+                [void]$logonIntentEvent.Set()
+                # The wait is courtesy only. The primary instance may still be
+                # inside its startup gates, in which case it picks the signal up
+                # when its timers start; the event stays set until then. Either
+                # way this process exits without saying anything.
+                [void]$logonIntentAckEvent.WaitOne(1500, $false)
+            }
+        }
+        catch { }
+        finally {
+            try { if ($null -ne $logonIntentEvent) { $logonIntentEvent.Dispose() } } catch { }
+            try { if ($null -ne $logonIntentAckEvent) { $logonIntentAckEvent.Dispose() } } catch { }
+            try { $instanceMutex.Dispose() } catch { }
+        }
+        return
+    }
+
     $activateEvent = $null
     $activateAckEvent = $null
     try {
@@ -95,10 +169,19 @@ if (-not $ownsInstanceMutex) {
     finally {
         try { if ($null -ne $activateEvent) { $activateEvent.Dispose() } } catch { }
         try { if ($null -ne $activateAckEvent) { $activateAckEvent.Dispose() } } catch { }
+        # Opened before the mutex on every path, including this one, so they
+        # have to be released here too even though a manual launch never
+        # signals them.
+        try { if ($null -ne $logonIntentEvent) { $logonIntentEvent.Dispose() } } catch { }
+        try { if ($null -ne $logonIntentAckEvent) { $logonIntentAckEvent.Dispose() } } catch { }
         try { $instanceMutex.Dispose() } catch { }
     }
     return
 }
+
+# The LogonIntent handles were opened before the mutex above and are retained
+# for this process lifetime. UIManager borrows them for polling; this scope
+# owns them and releases them in the finally block at the end of the file.
 
 $splash = $null
 if (-not $StartedFromLogon) {
@@ -121,6 +204,8 @@ catch {
     [System.Windows.Forms.MessageBox]::Show(
         ('Excel Query Trigger could not load its application files:' + [Environment]::NewLine + $_.Exception.Message),
         'Excel Query Trigger', 'OK', 'Error') | Out-Null
+    try { if ($null -ne $logonIntentEvent) { $logonIntentEvent.Dispose() } } catch { }
+    try { if ($null -ne $logonIntentAckEvent) { $logonIntentAckEvent.Dispose() } } catch { }
     try { $instanceMutex.ReleaseMutex() } catch { }
     try { $instanceMutex.Dispose() } catch { }
     return
@@ -234,7 +319,12 @@ try {
         $(if ($StartedFromLogon) { 'from Windows logon' } else { 'started by hand' }))
 
     # ---- run the dashboard (blocks until the user exits) ---------------------
-    Show-Dashboard -Shared $shared -Paths $paths -Config $config -StartedFromLogon:$StartedFromLogon -Splash $splash
+    if (-not [string]::IsNullOrWhiteSpace([string]$script:LogonIntentInitError)) {
+        Write-AppLog -Level 'WARN' -Message ('Windows logon hand-over signalling is unavailable: {0}. A sign-in that arrives while this instance is already running cannot be handed over.' -f $script:LogonIntentInitError)
+    }
+
+    Show-Dashboard -Shared $shared -Paths $paths -Config $config -StartedFromLogon:$StartedFromLogon -Splash $splash `
+        -LogonIntentEvent $logonIntentEvent -LogonIntentAckEvent $logonIntentAckEvent
     $splash = $null
 }
 catch {
@@ -292,6 +382,11 @@ finally {
     }
 
     try { Write-AppLog -Level 'INFO' -Message ('--- Excel Query Trigger Manager v{0} exited ---' -f (Get-AppVersion)) } catch { }
+
+    # This scope opened the logon hand-over handles, so this scope closes them.
+    # UIManager only borrowed them.
+    try { if ($null -ne $logonIntentEvent) { $logonIntentEvent.Dispose() } } catch { }
+    try { if ($null -ne $logonIntentAckEvent) { $logonIntentAckEvent.Dispose() } } catch { }
 
     try { $instanceMutex.ReleaseMutex() } catch { }
     try { $instanceMutex.Dispose() } catch { }

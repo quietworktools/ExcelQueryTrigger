@@ -1,5 +1,31 @@
 ﻿# Release Notes
 
+## v1.0.3 — Reliability and dashboard improvements
+
+**2026-09-02**
+
+- Improved file-trigger reliability, including better handling of files that are
+  renamed or replaced shortly after they are created.
+- Improved trigger grouping so several related file events arriving together are
+  handled as a single refresh request instead of separate ones.
+- Improved network-folder monitoring so temporary Wi-Fi, Ethernet and VPN changes
+  recover automatically without unnecessary error messages.
+- A network folder that becomes unavailable now only pauses the rules that use
+  it. Other network folders and all local folders keep watching, and monitoring
+  resumes on its own once the folder can be reached again.
+- Improved Windows sign-in triggers and startup handling, including a warning if
+  a sign-in rule is set up while the app is not configured to start with Windows.
+- When a refresh cannot start, the reason is now stated plainly - for example the
+  file is still being written, is still open in another program, is no longer
+  there, or the folder could not be reached.
+- A trigger file that disappears because it was renamed no longer holds up a
+  refresh for the full waiting time, and no longer fails the whole job on its own.
+- Improved dashboard layout and fixed panels extending beyond the right edge.
+- Fixed several Recent Activity and UI errors that could occur after failed or
+  incomplete trigger events.
+- Additional reliability improvements around Excel refresh completion, logging
+  and watcher recovery.
+
 ## v1.0.2 — Repository hygiene and privacy cleanup
 
 **2026-09-01**

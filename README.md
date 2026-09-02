@@ -2,7 +2,7 @@
 
 A Windows utility for automatically refreshing Excel Power Query workbooks in the background.
 
-**Current version: v1.0.2**
+**Current version: v1.0.3**
 
 ## Download
 

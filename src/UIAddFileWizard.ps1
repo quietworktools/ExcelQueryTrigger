@@ -825,6 +825,8 @@ function Invoke-AddFileWizard {
             return
         }
 
+        if (-not (Confirm-LogonRuleStartupRequirement -Rule $rule)) { return }
+
         $rules = New-Object System.Collections.ArrayList
         foreach ($existing in @($config['rules'])) { [void]$rules.Add($existing) }
         [void]$rules.Add($rule)

@@ -18,6 +18,12 @@ $script:EngineShared       = $null
 $script:LastHealthCheck    = [DateTime]::MinValue
 $script:LastStateSave      = [DateTime]::MinValue
 $script:LastScheduleCheck  = [DateTime]::MinValue
+$script:LastNetworkCheck   = [DateTime]::MinValue
+
+# The adapter check itself is free, so it can run far more often than the
+# watcher health check. Anything that touches a share keeps to its own
+# schedule inside the network monitor.
+$script:NetworkCheckSeconds = 2
 
 # How late a scheduled run may still start. It exists so that starting the
 # application at 07:31 for an 07:30 rule still runs it, while starting it at
@@ -67,7 +73,21 @@ function Update-AppStatus {
     }
     else {
         $summary = Get-WatcherSummary -Rules (Get-EngineRules)
-        if ($summary.Expected -gt 0 -and $summary.Active -lt $summary.Expected) {
+        $network = Get-NetworkMonitoringState
+
+        if ($network.State -ne 'Online' -and [int]$summary.Suspended -gt 0) {
+            # Being away from the office is an operating condition, not a fault.
+            # It gets its own status so the light is neither green (nothing is
+            # being watched) nor red (nothing is wrong).
+            $shared.Status = 'Waiting for network'
+            if ($null -eq $Detail) {
+                $Detail = '{0} network monitor(s) suspended. {1}' -f [int]$summary.Suspended, [string]$network.Detail
+                if ($summary.Expected -gt 0 -and $summary.Active -lt $summary.Expected) {
+                    $Detail += ' Also unavailable: {0}' -f ((@($summary.Inactive) -join ', '))
+                }
+            }
+        }
+        elseif ($summary.Expected -gt 0 -and $summary.Active -lt $summary.Expected) {
             $shared.Status = 'Degraded'
             if ($null -eq $Detail) {
                 $inactiveText = @($summary.Inactive) -join ', '
@@ -107,12 +127,47 @@ function Invoke-EngineReload {
         $script:EngineShared.StartupCurrent = [int]$script:EngineShared.StartupCurrent + 1
     }
 
+    # Every rule change reaches the engine as a Reload, so this is where the
+    # trigger definitions the pending state was collected under stop being
+    # current. Two different problems, two different treatments:
+    #
+    #   deleted / disabled rule -> drop the entry entirely (Clear-TriggerState)
+    #   surviving rule          -> drop only its pending window
+    #
+    # The second case is the one an id-based prune misses: a rule can keep its
+    # id while its folder, filter, type or watched events change, and files
+    # collected under the old definition would otherwise be dispatched against
+    # the new one. Reloads are infrequent, so simply discarding the in-flight
+    # window is the safe and simple answer. Cooldown survives on purpose - see
+    # Reset-TriggerPendingWindow.
+    $liveRuleIds = @{}
+    foreach ($rule in $engineRules) {
+        if (ConvertTo-BoolValue $rule.enabled $true) { $liveRuleIds[[string]$rule.id] = $true }
+    }
+    $discarded = 0
+    foreach ($stateRuleId in @(Get-TriggerStateRuleIds)) {
+        if (-not $liveRuleIds.ContainsKey($stateRuleId)) {
+            Clear-TriggerState -RuleId $stateRuleId
+            Write-AppLog -Level 'DEBUG' -Message ('Discarded trigger state for rule id {0} (deleted or disabled).' -f $stateRuleId) -NoActivity
+            continue
+        }
+        if (Reset-TriggerPendingWindow -RuleId $stateRuleId) { $discarded++ }
+    }
+    if ($discarded -gt 0) {
+        Write-AppLog -Level 'DEBUG' -Message `
+            ('Configuration reloaded while {0} rule(s) had events waiting in a debounce window. Those events were discarded so they cannot run against a changed trigger definition.' -f $discarded) -NoActivity
+    }
+
     $watcherRules = @($engineRules | Where-Object {
         (ConvertTo-BoolValue $_.enabled $true) -and (Test-TriggerUsesWatcher $_.trigger.type)
     })
     $script:EngineShared.StartupMessage = 'Activating file and folder monitors...'
     $script:EngineShared.StartupTotal   = $watcherRules.Count
     $script:EngineShared.StartupCurrent = 0
+    # Ask about the network before arming anything. Starting the application on
+    # a laptop that is already off the corporate network would otherwise open
+    # with a failure per network rule before the monitor had its first word.
+    Update-NetworkMonitoringState -Rules $engineRules -Paused ([bool]$script:EngineShared.Paused)
     Sync-RuleWatchers -Rules $engineRules -Paused ([bool]$script:EngineShared.Paused)
     $script:EngineShared.ConfigVersion = [int]$script:EngineShared.ConfigVersion + 1
 
@@ -282,6 +337,79 @@ function Invoke-EngineEventIntake {
         if ($null -eq $rule) { continue }
 
         if ($watcherEvent.EventName -eq 'Error') {
+            # Network FileSystemWatchers are commonly invalidated when Windows
+            # switches transport (for example corporate Wi-Fi -> Ethernet).
+            # GetIsNetworkAvailable() may stay true throughout that handover,
+            # so the actual watched folder is the authority before we classify
+            # the event as an application fault.
+            if (Test-RuleNetworkSuspended -Rule $rule) {
+                Write-AppLog -Level 'DEBUG' -RuleName $rule.name `
+                    -Message ('Watcher error while network monitoring is suspended, ignored: {0}' -f $watcherEvent.Message) -NoActivity
+                continue
+            }
+
+            if (Test-RuleUsesNetworkPath -Rule $rule) {
+                $folder = Get-WatchFolderForRule -Rule $rule
+                $isBufferOverflow = ([string]$watcherEvent.ExceptionType -eq 'System.IO.InternalBufferOverflowException') -or `
+                                    ([string]$watcherEvent.Message -match '(?i)buffer.*overflow')
+
+                # A buffer overflow means events may really have been lost. It
+                # is not a benign adapter handover and must remain visible.
+                if (-not $isBufferOverflow) {
+                    $pathReachable = $false
+                    try {
+                        $pathReachable = (-not [string]::IsNullOrWhiteSpace($folder)) -and `
+                                         (Test-Path -LiteralPath $folder)
+                    }
+                    catch { $pathReachable = $false }
+
+                    if ($pathReachable) {
+                        # Typical Wi-Fi/Ethernet/VPN route handover: the SMB
+                        # notification handle died, but the share itself is
+                        # already available through the new route. Re-arm the
+                        # watcher immediately and keep Recent Activity clean.
+                        Write-AppLog -Level 'DEBUG' -RuleName $rule.name `
+                            -Message ('Network watcher transport changed while the folder remained reachable. Recreating watcher quietly: {0}' -f $watcherEvent.Message) -NoActivity
+
+                        if (Start-RuleWatcher -Rule $rule -QuietUnavailable -IgnoreNetworkSuspension) {
+                            Set-RuleState -Shared $shared -RuleId ([string]$rule.id) -Values @{ WatcherStatus = 'Active' } | Out-Null
+                            continue
+                        }
+
+                        # Start-RuleWatcher logs the actual restart failure.
+                        Set-RuleState -Shared $shared -RuleId ([string]$rule.id) -Values @{ WatcherStatus = 'Error' } | Out-Null
+                        continue
+                    }
+
+                    # Windows is currently reporting no adapter at all and the
+                    # handover window has not expired. The probe above could
+                    # not have succeeded, so it says nothing about this folder.
+                    # Postpone the verdict: re-arm the watcher and force a
+                    # probe on the next network pass. If the link really is
+                    # gone, Update-NetworkMonitoringState commits to
+                    # NetworkOffline within the window and suspends everything.
+                    if (Test-NetworkAdapterHandoverActive) {
+                        Write-AppLog -Level 'DEBUG' -RuleName $rule.name `
+                            -Message ('Watcher error during a network adapter handover; folder verdict postponed: {0}' -f $watcherEvent.Message) -NoActivity
+                        Request-NetworkPathRecheck -Folder $folder
+                        if (Start-RuleWatcher -Rule $rule -QuietUnavailable -IgnoreNetworkSuspension) {
+                            Set-RuleState -Shared $shared -RuleId ([string]$rule.id) -Values @{ WatcherStatus = 'Active' } | Out-Null
+                        }
+                        continue
+                    }
+
+                    # The share is genuinely unavailable. Hand the folder to
+                    # the existing per-folder state machine instead of logging
+                    # one WatcherError per rule.
+                    Set-NetworkPathUnavailable -Rules @($shared.Rules) -Folder $folder
+                    continue
+                }
+
+                Request-NetworkPathRecheck -Folder $folder
+            }
+
+            # Local watcher errors, buffer overflow, or a genuine restart
+            # problem remain visible because they can mean lost trigger events.
             Write-AppLog -Level 'ERROR' -RuleName $rule.name -ErrorType 'WatcherError' `
                 -Message ('Watcher error: {0}. It will be recreated by the next health check.' -f $watcherEvent.Message)
             Set-RuleState -Shared $shared -RuleId ([string]$rule.id) -Values @{ WatcherStatus = 'Error' } | Out-Null
@@ -479,6 +607,26 @@ function Invoke-EngineScheduleCheck {
     }
 }
 
+function Invoke-EngineNetworkCheck {
+    <#
+        Runs immediately before the watcher health check on every iteration, so
+        the health check always sees a network verdict from this same pass.
+        Both live in the one engine thread, which is why no locking is needed
+        and why the two can never disagree about whether a rule is suspended.
+    #>
+    $shared = $script:EngineShared
+    if (((Get-Date) - $script:LastNetworkCheck).TotalSeconds -lt $script:NetworkCheckSeconds) { return }
+    $script:LastNetworkCheck = Get-Date
+
+    try {
+        Update-NetworkMonitoringState -Rules (Get-EngineRules) -Paused ([bool]$shared.Paused)
+    }
+    catch {
+        Write-AppLog -Level 'ERROR' -ErrorType 'UnexpectedError' `
+            -Message ('Network check failed: {0}' -f $_.Exception.Message)
+    }
+}
+
 function Invoke-EngineHealthCheck {
     $shared = $script:EngineShared
     $settings = Get-EngineAppSettings
@@ -550,6 +698,7 @@ function Complete-StartupWatcherInitialization {
         # missing watcher. QuietUnavailable avoids a warning every half-second
         # while the splash already tells the user which network location is
         # still unavailable.
+        Update-NetworkMonitoringState -Rules $rules -Paused $false
         Sync-RuleWatchers -Rules $rules -Paused $false -QuietUnavailable
 
         $summary = Get-WatcherSummary -Rules $rules
@@ -578,9 +727,13 @@ function Complete-StartupWatcherInitialization {
 
                     if ([int]$finalSummary.Active -ge [int]$finalSummary.Expected) {
                         Update-AppStatus
-                        if ([string]$shared.Status -eq 'Running') {
+                        if (Test-EngineStatusReady ([string]$shared.Status)) {
                             $shared.StartupMessage = 'Monitoring and workbook information are ready.'
-                            $shared.StatusDetail = '{0} watcher(s) active. Startup complete.' -f [int]$finalSummary.Active
+                            $shared.StatusDetail = $(if ([string]$shared.Status -eq 'Waiting for network') {
+                                '{0} watcher(s) active. {1}' -f [int]$finalSummary.Active, [string](Get-NetworkMonitoringState).Detail
+                            } else {
+                                '{0} watcher(s) active. Startup complete.' -f [int]$finalSummary.Active
+                            })
                             $shared.StartupReady = $true
                             return $true
                         }
@@ -680,7 +833,7 @@ function Start-Engine {
         if (-not $startupCompleted -and -not (ConvertTo-BoolValue $Shared.ShouldExit $false)) {
             throw 'Startup readiness ended before monitoring reached Running state.'
         }
-        if ($startupCompleted -and [string]$Shared.Status -eq 'Running') {
+        if ($startupCompleted -and (Test-EngineStatusReady ([string]$Shared.Status))) {
             Write-AppLog -Level 'INFO' -Message ('Engine ready. {0} rule(s) loaded. Dashboard may open.' -f (Get-EngineRules).Count)
         }
 
@@ -697,6 +850,12 @@ function Start-Engine {
                     Invoke-EngineReload
                 }
 
+                # The network verdict is established before anything reads the
+                # watcher event queue. A Wi-Fi drop during a long Excel call
+                # leaves watcher Error events sitting in that queue, and they
+                # arrive the moment the loop is free again - before any check
+                # had a chance to notice the machine went offline.
+                Invoke-EngineNetworkCheck
                 Invoke-EngineEventIntake
                 Invoke-EngineTriggerDispatch
                 Invoke-EngineScheduleCheck

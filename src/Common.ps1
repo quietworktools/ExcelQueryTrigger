@@ -8,10 +8,34 @@ Set-StrictMode -Version 1.0
 
 # Single source of truth for release/config versions. Both runspaces load this file.
 $script:AppName = 'Excel Query Trigger Manager'
-$script:AppVersion = '1.0.2'
+$script:AppVersion = '1.0.3'
 $script:ConfigSchemaVersion = 4
 
 function Get-AppVersion { return [string]$script:AppVersion }
+
+function Test-EngineStatusReady {
+    <#
+        The statuses in which the Dashboard may be shown and treated as
+        operational. 'Waiting for network' is one of them: a laptop away from
+        the office is a normal condition, not a startup failure, and the splash
+        must not sit there forever waiting for a share that is not coming back
+        until Monday.
+    #>
+    param([string]$Status)
+    return (@('Running', 'Waiting for network') -contains [string]$Status)
+}
+
+function Get-SafeLeaf {
+    <#
+        Split-Path throws on an empty string, and several records carry an
+        empty path on purpose (a job that failed before it reached a workbook
+        has no workbook). Callers only ever want a display name, so give them
+        one instead of an exception that reaches the UI as a red log line.
+    #>
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return '' }
+    try { return (Split-Path -Leaf $Path) } catch { return $Path }
+}
 function Get-ConfigSchemaVersion { return [int]$script:ConfigSchemaVersion }
 
 # ------------------------------------------------------------------------------
@@ -437,8 +461,12 @@ function New-SharedState {
     #>
     $shared = [hashtable]::Synchronized(@{})
 
-    $shared.Status          = 'Starting'   # Starting | Running | Paused | Degraded | Error | Stopping | Stopped
+    $shared.Status          = 'Starting'   # Starting | Running | Waiting for network | Paused | Degraded | Error | Stopping | Stopped
     $shared.StatusDetail    = ''
+    # Written by the engine's network monitor, read by the UI.
+    # Online | NetworkOffline | CheckingPaths | WaitingForPaths
+    $shared.NetworkState       = 'Online'
+    $shared.NetworkStateDetail = ''
     $shared.EngineAlive     = $false
     $shared.ShouldExit      = $false
     $shared.Paused          = $false

@@ -142,35 +142,87 @@ function Invoke-JobExecution {
         } | Select-Object -Unique)
         if ($waitForReady -and $triggerFiles.Count -gt 0) {
             Set-CurrentJobDisplay -Job $Job -Stage 'WaitingForFile'
+            # One trigger can collect several files, but that set is only what
+            # happened to land inside the debounce window - it is not a promise
+            # about the data. A file that has been renamed away can never become
+            # ready, so it is dropped with a warning and the refresh continues.
+            # A file that is still being written, still locked, or sitting on a
+            # share that stopped answering is a different matter: those fail the
+            # job, because refreshing early would save a half-written snapshot as
+            # a success.
+            $readyCount   = 0
+            $skippedFiles = New-Object System.Collections.ArrayList
+
             foreach ($triggerFile in $triggerFiles) {
                 Write-AppLog -Level 'INFO' -RuleName $Job.RuleName -Stage 'WaitingForFile' `
-                    -Message ('Waiting for the source file to be released: {0}' -f (Split-Path -Leaf $triggerFile))
+                    -Message ('Waiting for the source file to be released: {0}' -f (Get-SafeLeaf $triggerFile))
 
                 $readiness = Test-SourceFileReady -Path $triggerFile `
                     -IntervalSeconds (ConvertTo-IntValue $Job.Trigger.readyCheckIntervalSeconds 2 1) `
                     -TimeoutSeconds (ConvertTo-IntValue $Job.Trigger.readyTimeoutSeconds 60 1) `
                     -ShouldAbort $ShouldAbort
 
-                if (-not $readiness.Ready) {
-                    $Job.Status = $(if ($null -ne $ShouldAbort -and (& $ShouldAbort)) { 'Cancelled' } else { 'Failed' })
-                    $errorType = $(if ($Job.Status -eq 'Cancelled') { 'Cancelled' } else { 'FileReadyTimeout' })
-                    Write-AppLog -Level $(if ($Job.Status -eq 'Cancelled') { 'WARN' } else { 'ERROR' }) `
-                        -RuleName $Job.RuleName -Stage 'WaitingForFile' -ErrorType $errorType -Message $readiness.Reason
-                    [void]$Job.Results.Add(@{
-                        Workbook = ''; Success = $false; ErrorType = $errorType
-                        Message = $readiness.Reason; ElapsedSeconds = $readiness.WaitedSeconds; Saved = $false
-                    })
-                    Set-RuleState -Shared $Shared -RuleId $Job.RuleId -Values @{
-                        LastError = $readiness.Reason; LastResultText = ('{0}: source file not ready' -f $Job.Status)
-                    } | Out-Null
-                    if ($Job.Status -ne 'Cancelled' -and (ConvertTo-BoolValue $AppSettings.showErrorNotifications $true)) {
-                        Request-Notification -Shared $Shared -Level 'Error' -Title 'Refresh failed' -Text ('{0}: {1}' -f $Job.RuleName, $readiness.Reason)
-                    }
-                    return $Job
+                if ($readiness.Ready) {
+                    $readyCount++
+                    Write-AppLog -Level 'INFO' -RuleName $Job.RuleName -Stage 'WaitingForFile' `
+                        -Message ('Source file ready after {0} second(s): {1}' -f $readiness.WaitedSeconds, (Get-SafeLeaf $triggerFile))
+                    continue
                 }
 
-                Write-AppLog -Level 'INFO' -RuleName $Job.RuleName -Stage 'WaitingForFile' `
-                    -Message ('Source file ready after {0} second(s): {1}' -f $readiness.WaitedSeconds, (Split-Path -Leaf $triggerFile))
+                if ($readiness.Vanished) {
+                    [void]$skippedFiles.Add((Get-SafeLeaf $triggerFile))
+                    Write-AppLog -Level 'WARN' -RuleName $Job.RuleName -Stage 'WaitingForFile' `
+                        -ErrorType 'SourceFileVanished' `
+                        -Message ('Skipping this source file and continuing: {0}' -f $readiness.Reason)
+                    continue
+                }
+
+                # Cancelled, still being written, still locked, or the share is
+                # unreachable. None of these may quietly become a refresh.
+                $cancelled = ($null -ne $ShouldAbort -and (& $ShouldAbort))
+                $Job.Status = $(if ($cancelled) { 'Cancelled' } else { 'Failed' })
+                $errorType  = $(if ($cancelled) { 'Cancelled' }
+                                elseif ($readiness.Unreachable) { 'PathUnavailable' }
+                                else { 'FileReadyTimeout' })
+                Write-AppLog -Level $(if ($cancelled) { 'WARN' } else { 'ERROR' }) `
+                    -RuleName $Job.RuleName -Stage 'WaitingForFile' -ErrorType $errorType -Message $readiness.Reason
+                [void]$Job.Results.Add(@{
+                    Workbook = ''; Success = $false; ErrorType = $errorType
+                    Message = $readiness.Reason; ElapsedSeconds = $readiness.WaitedSeconds; Saved = $false
+                })
+                Set-RuleState -Shared $Shared -RuleId $Job.RuleId -Values @{
+                    LastError = $readiness.Reason; LastResultText = ('{0}: source file not ready' -f $Job.Status)
+                } | Out-Null
+                if (-not $cancelled -and (ConvertTo-BoolValue $AppSettings.showErrorNotifications $true)) {
+                    Request-Notification -Shared $Shared -Level 'Error' -Title 'Refresh failed' -Text ('{0}: {1}' -f $Job.RuleName, $readiness.Reason)
+                }
+                return $Job
+            }
+
+            if ($readyCount -eq 0) {
+                # Every file the trigger collected had already been renamed away.
+                # There is nothing this job can confirm, so it does not run.
+                $reasonText = 'Every source file this trigger collected was renamed or replaced before it could be read.'
+                $Job.Status = 'Failed'
+                Write-AppLog -Level 'ERROR' -RuleName $Job.RuleName -Stage 'WaitingForFile' `
+                    -ErrorType 'SourceFileVanished' -Message $reasonText
+                [void]$Job.Results.Add(@{
+                    Workbook = ''; Success = $false; ErrorType = 'SourceFileVanished'
+                    Message = $reasonText; ElapsedSeconds = 0; Saved = $false
+                })
+                Set-RuleState -Shared $Shared -RuleId $Job.RuleId -Values @{
+                    LastError = $reasonText; LastResultText = 'Failed: source file not ready'
+                } | Out-Null
+                if (ConvertTo-BoolValue $AppSettings.showErrorNotifications $true) {
+                    Request-Notification -Shared $Shared -Level 'Error' -Title 'Refresh failed' -Text ('{0}: {1}' -f $Job.RuleName, $reasonText)
+                }
+                return $Job
+            }
+
+            if ($skippedFiles.Count -gt 0) {
+                Write-AppLog -Level 'WARN' -RuleName $Job.RuleName -Stage 'WaitingForFile' `
+                    -Message ('Continuing with {0} of {1} source file(s). Renamed or replaced while waiting: {2}' -f `
+                        $readyCount, $triggerFiles.Count, ((@($skippedFiles.ToArray())) -join ', '))
             }
         }
 

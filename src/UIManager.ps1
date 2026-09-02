@@ -21,6 +21,13 @@ $script:UiExiting       = $false
 $script:UiControls      = @{}
 $script:UiLastRuleRefresh = [DateTime]::MinValue
 $script:UiLogonPromptDone = $true
+# Set once, for the lifetime of this engine session, the first time the logon
+# path is armed - whether that came from -StartedFromLogon on this process or
+# from a LogonIntent signal sent by a logon launch that lost the mutex race.
+# It is never cleared, so the same sign-in cannot run the At Logon rules twice
+# and a later signal cannot replay them.
+$script:UiLogonArmed        = $false
+$script:UiStartupReadyForLogon = $false
 $script:UiLastManualWorkbook = ''
 $script:UiFontSize        = 9
 $script:UiFontName        = ''
@@ -113,7 +120,15 @@ function Set-FormWithinWorkingArea {
         second guard for small screens, taskbars, remote sessions and unusual work
         areas: clamp only when needed and enable scrolling instead of hiding controls.
     #>
-    param([System.Windows.Forms.Form]$Form)
+    param(
+        [System.Windows.Forms.Form]$Form,
+        # The Dashboard lays itself out from the client size on every resize, so
+        # it never needs a scroll viewport - and it must not have one. A Form
+        # with AutoScroll measures anchored children against its scrollable
+        # display rectangle instead of its client rectangle, which is what made
+        # the panes creep past the right window border a few pixels per resize.
+        [switch]$NoAutoScroll
+    )
 
     try {
         # Last-resort protection for compact captions throughout every dialog.
@@ -140,7 +155,7 @@ function Set-FormWithinWorkingArea {
         $maxHeight = $work.Height - 16
         if ($Form.Width -le $maxWidth -and $Form.Height -le $maxHeight) { return }
 
-        $Form.AutoScroll = $true
+        if (-not $NoAutoScroll) { $Form.AutoScroll = $true }
         $Form.Size = New-Object System.Drawing.Size(
             [Math]::Min($Form.Width, $maxWidth),
             [Math]::Min($Form.Height, $maxHeight))
@@ -271,6 +286,7 @@ function Get-StatusIconKey {
         'Stopped'    { return 'Paused' }
         'Degraded'   { return 'Error' }
         'Error'      { return 'Error' }
+        'Waiting for network' { return 'Paused' }
         default      { return 'Running' }
     }
 }
@@ -281,6 +297,7 @@ function Get-StatusColor {
         'Refreshing' { return [System.Drawing.Color]::FromArgb(176, 132, 10) }
         'Paused'     { return [System.Drawing.Color]::FromArgb(90, 90, 90) }
         'Degraded'   { return [System.Drawing.Color]::FromArgb(190, 90, 20) }
+        'Waiting for network' { return [System.Drawing.Color]::FromArgb(60, 105, 160) }
         'Error'      { return [System.Drawing.Color]::FromArgb(180, 40, 35) }
         'Stopped'    { return [System.Drawing.Color]::FromArgb(90, 90, 90) }
         default      { return [System.Drawing.Color]::FromArgb(30, 120, 55) }
@@ -297,7 +314,12 @@ function Show-Dashboard {
         [Parameter(Mandatory = $true)][hashtable]$Paths,
         [Parameter(Mandatory = $true)][hashtable]$Config,
         [switch]$StartedFromLogon,
-        [AllowNull()]$Splash = $null
+        [AllowNull()]$Splash = $null,
+        # Opened and owned by the entry point before startup, so a concurrent
+        # logon launch cannot destroy the kernel object while this instance is
+        # still loading. Borrowed here; never disposed here.
+        [AllowNull()]$LogonIntentEvent = $null,
+        [AllowNull()]$LogonIntentAckEvent = $null
     )
 
     $script:UiShared = $Shared
@@ -946,6 +968,52 @@ function Show-Dashboard {
         Write-AppLog -Level 'WARN' -Message ('Single-instance Dashboard activation could not be initialized: {0}' -f $_.Exception.Message)
     }
 
+    # A Windows logon launch that found this instance already running signals
+    # LogonIntent instead of starting an engine of its own. The handles are NOT
+    # created here: the entry point opened them straight after it won the
+    # single-instance mutex, precisely so the kernel object already exists
+    # while this startup path is still running. A signal raised during module
+    # loading or the startup gates is therefore still pending now, because an
+    # AutoReset event stays signalled until something waits on it.
+    #
+    # The timer starts with the others after the gates, for the same reason
+    # activation does: a logon prompt must not appear over a Dashboard that is
+    # not ready yet.
+    try {
+        if ($null -eq $LogonIntentEvent -or $null -eq $LogonIntentAckEvent) {
+            # No usable channel. A -StartedFromLogon launch of this process
+            # still arms logon rules normally; only the hand-over is lost.
+            $script:UiControls.LogonIntentEvent = $null
+            $script:UiControls.LogonIntentAckEvent = $null
+        }
+        else {
+            $logonIntentTimer = New-Object System.Windows.Forms.Timer
+            $logonIntentTimer.Interval = 200
+            $logonIntentTimer.Add_Tick({
+                try {
+                    if ($null -eq $script:UiControls.LogonIntentEvent) { return }
+                    if ($script:UiControls.LogonIntentEvent.WaitOne(0, $false)) {
+                        # Acknowledge first. Start-LogonTriggerCountdown may
+                        # decline (already armed), which is still a valid answer
+                        # to the sender, and the sender must never be left
+                        # waiting because the prompt logic took a moment.
+                        try { [void]$script:UiControls.LogonIntentAckEvent.Set() } catch { }
+                        [void](Start-LogonTriggerCountdown -Origin 'signal')
+                    }
+                }
+                catch {
+                    try { [void]$script:UiControls.LogonIntentAckEvent.Set() } catch { }
+                }
+            })
+            $script:UiControls.LogonIntentEvent = $LogonIntentEvent
+            $script:UiControls.LogonIntentAckEvent = $LogonIntentAckEvent
+            $script:UiControls.LogonIntentTimer = $logonIntentTimer
+        }
+    }
+    catch {
+        Write-AppLog -Level 'WARN' -Message ('Windows logon hand-over polling could not be initialized: {0}' -f $_.Exception.Message)
+    }
+
     $startMinimized = ConvertTo-BoolValue $script:UiConfig.appSettings.startMinimized $true
     $minimizeToTray = ConvertTo-BoolValue $script:UiConfig.appSettings.minimizeToTray $true
     $firstRunWelcomeDue = Test-FirstRunWelcomeDue
@@ -1045,7 +1113,7 @@ function Show-Dashboard {
             $Shared.StartupUiReady = $true
 
             while (((-not (ConvertTo-BoolValue $Shared.StartupReady $false)) -or
-                    [string]$Shared.Status -ne 'Running') -and
+                    -not (Test-EngineStatusReady ([string]$Shared.Status))) -and
                    [string]::IsNullOrWhiteSpace([string]$Shared.FatalError)) {
                 $monitorTotal = [Math]::Max(0, [int]$Shared.StartupTotal)
                 $monitorCurrent = [Math]::Min([int]$Shared.StartupCurrent, $monitorTotal)
@@ -1081,15 +1149,16 @@ function Show-Dashboard {
             # This is the sole normal path to closing the splash.
             # The explicit status assertion makes a Degraded first frame
             # impossible even if a future startup refactor changes one gate.
-            if (-not (ConvertTo-BoolValue $Shared.StartupReady $false) -or [string]$Shared.Status -ne 'Running') {
+            if (-not (ConvertTo-BoolValue $Shared.StartupReady $false) -or -not (Test-EngineStatusReady ([string]$Shared.Status))) {
                 throw ('Dashboard startup gate failed. Status={0}, Ready={1}' -f [string]$Shared.Status, [string]$Shared.StartupReady)
             }
 
+            $monitoringStatus = [string]$Shared.Status
             $finalDetail = $(if ($null -ne $workbookScanStatus -and [int]$workbookScanStatus.Total -gt 0) {
-                'Workbook information loaded: {0} read, {1} unavailable. Monitoring status: Running.' -f `
-                    [int]$workbookScanStatus.Succeeded, [int]$workbookScanStatus.Failed
+                'Workbook information loaded: {0} read, {1} unavailable. Monitoring status: {2}.' -f `
+                    [int]$workbookScanStatus.Succeeded, [int]$workbookScanStatus.Failed, $monitoringStatus
             } else {
-                'Monitoring status: Running. No workbook information needed to be loaded.'
+                'Monitoring status: {0}. No workbook information needed to be loaded.' -f $monitoringStatus
             })
             $workbookOutcome = $(if ($null -ne $workbookScanStatus -and [int]$workbookScanStatus.Failed -gt 0) {
                 '[!!] Some workbook information could not be read'
@@ -1127,7 +1196,7 @@ function Show-Dashboard {
         $form.ShowInTaskbar = $false
     }
     else {
-        Set-FormWithinWorkingArea -Form $form
+        Set-FormWithinWorkingArea -Form $form -NoAutoScroll
         $form.Show()
         if ($startMinimized) { $form.WindowState = 'Minimized' }
     }
@@ -1153,36 +1222,174 @@ function Show-Dashboard {
 
     # Start the logon countdown only after startup preparation is finished.
     $script:UiLogonPromptDone = $true
-    if ($StartedFromLogon -and (Get-LogonRuleList -Config $script:UiConfig).Count -gt 0) {
-        $script:UiLogonPromptDone = $false
-        $delaySeconds = ConvertTo-IntValue $script:UiConfig.appSettings.startupPromptDelaySeconds 30 0
-        $logonTimer = New-Object System.Windows.Forms.Timer
-        $logonTimer.Interval = [Math]::Max(1000, $delaySeconds * 1000)
-        $logonTimer.Add_Tick({
-            $script:UiControls.LogonTimer.Stop()
-            if ($script:UiLogonPromptDone) { return }
-            $script:UiLogonPromptDone = $true
-            try {
-                Invoke-LogonRefreshDecision -Shared $script:UiShared -Config $script:UiConfig
-            }
-            catch {
-                Write-AppLog -Level 'ERROR' -ErrorType 'UnexpectedError' `
-                    -Message ('Logon refresh prompt failed: {0}' -f $_.Exception.Message)
-            }
-        })
-        $logonTimer.Start()
-        $script:UiControls.LogonTimer = $logonTimer
-        Write-AppLog -Level 'INFO' `
-            -Message ('Logon rules found. The refresh prompt will appear in {0} seconds.' -f $delaySeconds)
+    $script:UiStartupReadyForLogon = $true
+    if ($StartedFromLogon) {
+        [void](Start-LogonTriggerCountdown -Origin 'startup')
     }
 
     # Visual polling begins only after startup preparation, preventing timer
     # dialogs or scan polling from competing with the splash loop.
     $timer.Start()
     try { if ($script:UiControls.ContainsKey('ActivateTimer')) { $script:UiControls.ActivateTimer.Start() } } catch { }
+    try { if ($script:UiControls.ContainsKey('LogonIntentTimer')) { $script:UiControls.LogonIntentTimer.Start() } } catch { }
 
     # The tray icon owns the application lifetime; no form is passed here.
     [System.Windows.Forms.Application]::Run()
+}
+
+function Test-RuleIsActiveLogonRule {
+    <#  An enabled rule whose trigger is "At Windows logon".  #>
+    param($Rule)
+    if ($null -eq $Rule) { return $false }
+    if (-not (ConvertTo-BoolValue $Rule.enabled $true)) { return $false }
+    return (Test-TriggerIsLogon ([string]$Rule.trigger.type))
+}
+
+function Confirm-LogonRuleStartupRequirement {
+    <#
+        .SYNOPSIS
+            Stops the application from storing an At Windows logon rule that
+            can never fire. Returns $true to go ahead with the save.
+        .DESCRIPTION
+            An "At Windows logon" rule only runs because Windows starts the
+            application at sign-in. With "Start it when I sign in to Windows"
+            switched off, such a rule looks completely valid on the Dashboard
+            and simply never happens - the worst kind of failure, because
+            nothing reports it.
+
+            Called from every path that can produce an enabled logon rule: the
+            rule editor, the add-file wizard, and the enable/disable toggle.
+            Rules that are not logon rules, or are saved disabled, pass
+            straight through, as does anything saved while startup is already
+            registered and healthy.
+    #>
+    param($Rule)
+
+    if (-not (Test-RuleIsActiveLogonRule -Rule $Rule)) { return $true }
+
+    $health = Get-StartupRegistrationHealth -Paths $script:UiPaths
+
+    # Registered, points here, and Windows has not switched it off: nothing to
+    # warn about.
+    if ($health.Healthy) { return $true }
+
+    # Registered but disabled in Settings > Startup Apps. Rewriting the Run
+    # value would not clear that, and this application has no business
+    # reaching into StartupApproved, so say so and let the user decide.
+    if ($health.Registered -and $health.DisabledByWindows) {
+        $answer = [System.Windows.Forms.MessageBox]::Show(
+            ('This trigger requires Excel Query Trigger to start with Windows.' + [Environment]::NewLine + [Environment]::NewLine +
+             'The startup entry exists, but Windows has switched it off under Settings > Apps > Startup. Until it is switched back on there, this rule will not run automatically.' + [Environment]::NewLine + [Environment]::NewLine +
+             'Save the rule anyway?'),
+            'Windows startup is switched off', 'YesNo', 'Warning')
+        return ($answer -eq [System.Windows.Forms.DialogResult]::Yes)
+    }
+
+    # Registered but stale or broken: repointing it is exactly what the Enable
+    # button does, so offer the same choice as the not-registered case.
+    $detail = ''
+    if ($health.Registered -and -not [string]::IsNullOrWhiteSpace([string]$health.Reason)) {
+        $detail = [Environment]::NewLine + [string]$health.Reason + [Environment]::NewLine
+    }
+
+    $answer = [System.Windows.Forms.MessageBox]::Show(
+        ('This trigger requires Excel Query Trigger to start with Windows.' + [Environment]::NewLine + $detail + [Environment]::NewLine +
+         'Enable "Start it when I sign in to Windows" now?' + [Environment]::NewLine + [Environment]::NewLine +
+         'Choose Cancel to go back without saving the rule.'),
+        'Start with Windows', 'OKCancel', 'Question')
+    if ($answer -ne [System.Windows.Forms.DialogResult]::OK) { return $false }
+
+    $result = Set-StartupRegistration -Paths $script:UiPaths -Enabled $true
+    if (-not $result.Success) {
+        [System.Windows.Forms.MessageBox]::Show(
+            ([string]$result.Message + [Environment]::NewLine + [Environment]::NewLine +
+             'The rule has not been saved. Fix the startup entry in Settings and try again.'),
+            'Windows startup', 'OK', 'Warning') | Out-Null
+        return $false
+    }
+
+    # Keep the settings file honest about what is actually registered, so the
+    # Settings dialog does not offer to "turn on" something already on.
+    try {
+        $script:UiConfig.appSettings.startWithWindows = $true
+        Save-AppConfiguration -Path $script:UiPaths.ConfigPath -Config $script:UiConfig
+    }
+    catch { }
+
+    Write-AppLog -Level 'INFO' -Message 'Enabled start with Windows because an At Windows logon rule requires it.'
+    return $true
+}
+
+function Start-LogonTriggerCountdown {
+    <#
+        .SYNOPSIS
+            Arms the At Logon rules for this sign-in. The only way logon rules
+            are ever started.
+        .DESCRIPTION
+            Two callers reach this: the -StartedFromLogon launch itself, and a
+            LogonIntent signal from a logon launch that found this instance
+            already running. Both mean the same thing - Windows signed the user
+            in and the At Logon rules are due - so both take the identical
+            path: the configured startup delay, then Invoke-LogonRefreshDecision,
+            which applies the existing Automatic / Ask behaviour.
+
+            $script:UiLogonArmed makes this at-most-once per engine session.
+            It is checked before anything else and never cleared, so a
+            duplicate signal, or a signal arriving after the prompt has already
+            been shown, is ignored rather than replayed.
+
+            Returns $true when this call armed the countdown.
+    #>
+    param([string]$Origin = 'startup')
+
+    if ($script:UiLogonArmed) {
+        Write-AppLog -Level 'DEBUG' `
+            -Message ('Windows logon intent ({0}) ignored: the logon trigger has already been handled in this session.' -f $Origin) -NoActivity
+        return $false
+    }
+
+    # Claim the session before any early return below. A configuration with no
+    # logon rules has still "handled" this sign-in; a second signal must not
+    # come back and arm it because a rule was added in between.
+    $script:UiLogonArmed = $true
+
+    # Bare call, no @() wrapper. Get-LogonRuleList returns ",$found" so that a
+    # single rule is not unrolled; wrapping that in @() turns the EMPTY result
+    # into a one-element array and this early return would never fire.
+    if ((Get-LogonRuleList -Config $script:UiConfig).Count -eq 0) {
+        Write-AppLog -Level 'DEBUG' `
+            -Message ('Windows logon detected ({0}) but no enabled At Windows logon rules are configured.' -f $Origin) -NoActivity
+        return $false
+    }
+
+    $script:UiLogonPromptDone = $false
+    $delaySeconds = ConvertTo-IntValue $script:UiConfig.appSettings.startupPromptDelaySeconds 30 0
+    $logonTimer = New-Object System.Windows.Forms.Timer
+    $logonTimer.Interval = [Math]::Max(1000, $delaySeconds * 1000)
+    $logonTimer.Add_Tick({
+        $script:UiControls.LogonTimer.Stop()
+        if ($script:UiLogonPromptDone) { return }
+        $script:UiLogonPromptDone = $true
+        try {
+            Invoke-LogonRefreshDecision -Shared $script:UiShared -Config $script:UiConfig
+        }
+        catch {
+            Write-AppLog -Level 'ERROR' -ErrorType 'UnexpectedError' `
+                -Message ('Logon refresh prompt failed: {0}' -f $_.Exception.Message)
+        }
+    })
+    $logonTimer.Start()
+    $script:UiControls.LogonTimer = $logonTimer
+
+    if ($Origin -eq 'signal') {
+        Write-AppLog -Level 'INFO' `
+            -Message ('Windows sign-in detected while the application was already running. Logon rules found; the refresh prompt will appear in {0} seconds.' -f $delaySeconds)
+    }
+    else {
+        Write-AppLog -Level 'INFO' `
+            -Message ('Logon rules found. The refresh prompt will appear in {0} seconds.' -f $delaySeconds)
+    }
+    return $true
 }
 
 function Register-DashboardHandlers {
@@ -1446,12 +1653,15 @@ function Register-DashboardHandlers {
 
 function Show-DashboardWindow {
     $form = $script:UiControls.Form
-    Set-FormWithinWorkingArea -Form $form
+    Set-FormWithinWorkingArea -Form $form -NoAutoScroll
+    $form.AutoScroll = $false
     $form.Show()
     $form.ShowInTaskbar = $true
     $form.WindowState   = 'Normal'
     $form.BringToFront()
     [void]$form.Activate()
+    # Repairs a window that already drifted in an earlier session.
+    Set-RulesPaneMode -Mode ([string]$script:UiConfig.appSettings.rulesPaneMode)
 }
 
 function Set-RulesPaneMode {
@@ -1496,6 +1706,47 @@ function Set-RulesPaneHeight {
     $current    = $script:UiControls.CurrentGroup
     $pending    = $script:UiControls.PendingGroup
     $activity   = $script:UiControls.ActivityGroup
+
+    # ---- widths -----------------------------------------------------------
+    # Anchoring alone cannot be trusted for these four panes. They are moved
+    # and resized from inside the Resize event, and WinForms re-measures an
+    # anchored control's distance to the right edge every time its bounds are
+    # written - against whatever the parent's display rectangle happens to be
+    # at that instant. Each resize shaved a few pixels off that distance until
+    # Trigger Rules and Pending Jobs sat flush against, and then past, the
+    # right window border. Writing the width from the client size on every
+    # layout pass makes the margin exact again instead of cumulative, and it
+    # repairs a window that has already drifted.
+    $sideMargin  = 12
+    $innerMargin = 10
+    $clientWidth = $form.ClientSize.Width
+    $paneWidth   = [Math]::Max(320, $clientWidth - (2 * $sideMargin))
+
+    $rules.Left     = $sideMargin
+    $rules.Width    = $paneWidth
+    $activity.Left  = $sideMargin
+    $activity.Width = $paneWidth
+    $current.Left   = $sideMargin
+    $pending.Left   = $current.Right + $sideMargin
+    $pending.Width  = [Math]::Max(200, $clientWidth - $sideMargin - $pending.Left)
+
+    if ($script:UiControls.ContainsKey('StatusDetail')) {
+        $script:UiControls.StatusDetail.Width = [Math]::Max(200, $clientWidth - 30)
+    }
+
+    foreach ($pair in @(
+        @{ Pane = $rules;    Child = $script:UiControls.Rules },
+        @{ Pane = $rules;    Child = $script:UiControls.RulesEmpty },
+        @{ Pane = $rules;    Child = $script:UiControls.RuleButtonRow },
+        @{ Pane = $pending;  Child = $script:UiControls.Pending },
+        @{ Pane = $activity; Child = $script:UiControls.Activity },
+        @{ Pane = $activity; Child = $script:UiControls.Detail })) {
+        $child = $pair.Child
+        if ($null -eq $child) { continue }
+        $child.Width = [Math]::Max(120, $pair.Pane.Width - $child.Left - $innerMargin)
+    }
+
+    # ---- heights ----------------------------------------------------------
     $minimum    = 154
     $footerTop  = $form.ClientSize.Height - 44
     $minimumActivity = 170
@@ -2312,6 +2563,8 @@ function Invoke-RuleAdd {
         return
     }
 
+    if (-not (Confirm-LogonRuleStartupRequirement -Rule $rule)) { return }
+
     $rules = New-Object System.Collections.ArrayList
     foreach ($existing in @($script:UiConfig.rules)) { [void]$rules.Add($existing) }
     [void]$rules.Add($rule)
@@ -2336,6 +2589,8 @@ function Invoke-RuleEdit {
             'Duplicate rule', 'OK', 'Information') | Out-Null
         return
     }
+
+    if (-not (Confirm-LogonRuleStartupRequirement -Rule $edited)) { return }
 
     $rules = New-Object System.Collections.ArrayList
     foreach ($existing in @($script:UiConfig.rules)) {
@@ -2367,7 +2622,19 @@ function Invoke-RuleDelete {
 function Invoke-RuleToggle {
     $selected = Get-SelectedRule
     if ($null -eq $selected) { return }
-    $selected.enabled = -not (ConvertTo-BoolValue $selected.enabled $true)
+    $wasEnabled = ConvertTo-BoolValue $selected.enabled $true
+    $selected.enabled = -not $wasEnabled
+
+    # Enabling a logon rule is the same silent-failure risk as creating one.
+    # The rule object here is the live configuration entry, so a cancelled
+    # confirmation has to put the flag back rather than just returning.
+    if (-not $wasEnabled) {
+        if (-not (Confirm-LogonRuleStartupRequirement -Rule $selected)) {
+            $selected.enabled = $wasEnabled
+            return
+        }
+    }
+
     if (Save-UiConfiguration) { Update-RuleList }
 }
 
@@ -2973,9 +3240,31 @@ function Invoke-OpenLog {
 }
 
 function Invoke-SettingsDialog {
+    $startupWasRegistered = Test-StartupRegistration
     $updated = Show-SettingsDialog -AppSettings $script:UiConfig.appSettings -Paths $script:UiPaths
     if ($null -eq $updated) { return }
     $script:UiConfig.appSettings = $updated
+
+    # Turning startup off leaves any "At Windows logon" rule configured but
+    # unable to fire. Say so plainly. The rules are deliberately left exactly
+    # as they are: this application has no established pattern of deleting or
+    # disabling a user's rules on its behalf, and silently doing so here would
+    # be a worse surprise than the warning.
+    if ($startupWasRegistered -and -not (Test-StartupRegistration)) {
+        $logonRules = Get-LogonRuleList -Config $script:UiConfig   # bare: see Start-LogonTriggerCountdown
+        if ($logonRules.Count -gt 0) {
+            $names = (@($logonRules | ForEach-Object { [string]$_.name }) -join [Environment]::NewLine + '  ')
+            [System.Windows.Forms.MessageBox]::Show(
+                ('Excel Query Trigger will no longer start when you sign in to Windows.' + [Environment]::NewLine + [Environment]::NewLine +
+                 ('{0} rule(s) use the "At Windows logon" trigger and will not run automatically any more:' -f $logonRules.Count) + [Environment]::NewLine +
+                 '  ' + $names + [Environment]::NewLine + [Environment]::NewLine +
+                 'The rules are kept as they are. You can still run them with Run Now, or switch startup back on in Settings.'),
+                'Logon rules will not run', 'OK', 'Warning') | Out-Null
+            Write-AppLog -Level 'WARN' -Message `
+                ('Start with Windows was switched off while {0} At Windows logon rule(s) are configured. Those rules will not run automatically.' -f $logonRules.Count)
+        }
+    }
+
     if (Save-UiConfiguration) { Update-RuleList }
 }
 
@@ -3037,6 +3326,12 @@ function Stop-Application {
     try { if ($script:UiControls.ContainsKey('ActivateTimer')) { $script:UiControls.ActivateTimer.Stop(); $script:UiControls.ActivateTimer.Dispose() } } catch { }
     try { if ($script:UiControls.ContainsKey('ActivateEvent')) { $script:UiControls.ActivateEvent.Dispose() } } catch { }
     try { if ($script:UiControls.ContainsKey('ActivateAckEvent')) { $script:UiControls.ActivateAckEvent.Dispose() } } catch { }
+    try { if ($script:UiControls.ContainsKey('LogonIntentTimer')) { $script:UiControls.LogonIntentTimer.Stop(); $script:UiControls.LogonIntentTimer.Dispose() } } catch { }
+    # The LogonIntent handles are owned by the entry point, which disposes them
+    # after this returns. Releasing them here would close the kernel object
+    # early and double-dispose it.
+    $script:UiControls.LogonIntentEvent = $null
+    $script:UiControls.LogonIntentAckEvent = $null
     try { Stop-BackgroundUpdateCheck } catch { }
     try { Stop-WorkbookInfoBackgroundScan } catch { }
     try { Stop-RefreshApprovalBackgroundCheck } catch { }
@@ -3133,6 +3428,14 @@ function Get-FailureExplanation {
             return @{ Sentence = 'The file that set this off was still being written when time ran out.'
                       ActionLabel = 'Try again'; Action = 'Retry' }
         }
+        'SourceFileVanished' {
+            return @{ Sentence = 'The file that set this off was renamed or replaced before it could be read. Systems that write under a temporary name and rename it afterwards do this; watching for the final name avoids it.'
+                      ActionLabel = 'Open its settings'; Action = 'Edit' }
+        }
+        'PathUnavailable' {
+            return @{ Sentence = 'The folder holding the file that set this off stopped answering, so nothing was refreshed.'
+                      ActionLabel = 'Try again'; Action = 'Retry' }
+        }
         'MacroSecurityError' {
             return @{ Sentence = 'Excel would not open this file with macros disabled, and macros are not allowed by default.'
                       ActionLabel = 'Open its settings'; Action = 'Edit' }
@@ -3221,6 +3524,8 @@ function Get-RuleStatusText {
         'Paused'            { return @{ Text = 'Paused';          Explanation = 'Monitoring is paused for the whole application. Press Resume Monitoring to carry on.' } }
         'Disabled'          { return @{ Text = 'Turned off';      Explanation = 'This rule is switched off. Use Enable / Disable to switch it back on.' } }
         'PathUnavailable'   { return @{ Text = 'Folder not found'; Explanation = 'The folder or drive being watched cannot be reached right now. It is retried automatically.' } }
+        'NetworkOffline'    { return @{ Text = 'No network';       Explanation = 'There is no network connection, so watching this folder is suspended. It starts again on its own once the connection returns.' } }
+        'WaitingForNetwork' { return @{ Text = 'Waiting for network'; Explanation = 'There is a network, but this folder cannot be reached from where you are. It is retried quietly and starts again on its own.' } }
         'Misconfigured'     { return @{ Text = 'Needs fixing';    Explanation = 'Something in this rule is incomplete - open it with Edit and check the trigger.' } }
         'Error'             { return @{ Text = 'Problem';         Explanation = 'Watching could not be started. The activity list below has the reason.' } }
     }
@@ -3693,7 +3998,7 @@ function Get-RuleQueryFieldTooltip {
 
     $lines = New-Object System.Collections.ArrayList
     foreach ($action in $actions) {
-        $workbook = Split-Path -Leaf ([string]$action.path)
+        $workbook = Get-SafeLeaf ([string]$action.path)
         if ([string]::IsNullOrWhiteSpace($workbook)) { $workbook = 'Workbook' }
 
         if ([string]$action.refreshMethod -eq 'SelectedQueries') {
@@ -4180,7 +4485,7 @@ function Update-ActivityDetail {
             }
             [void]$lines.Add(('  started  : {0}   finished: {1}' -f $record.startedAt, $record.finishedAt))
             foreach ($workbookResult in @($record.results)) {
-                [void]$lines.Add(('  workbook : {0} -> {1} {2} ({3}s)' -f (Split-Path -Leaf ([string]$workbookResult.workbook)),
+                [void]$lines.Add(('  workbook : {0} -> {1} {2} ({3}s)' -f (Get-SafeLeaf ([string]$workbookResult.workbook)),
                     $(if ($workbookResult.success) { 'OK' } else { 'FAILED' }),
                     [string]$workbookResult.errorType, [string]$workbookResult.elapsed))
                 if (@($workbookResult.queries).Count -gt 0) {
@@ -4742,7 +5047,7 @@ function Get-ApprovalReasonText {
     param([hashtable]$Request)
     $source = [string]$Request.Source
     if ($source -eq 'File') {
-        $leaf = Split-Path -Leaf ([string]$Request.TriggerFile)
+        $leaf = Get-SafeLeaf ([string]$Request.TriggerFile)
         if ([string]::IsNullOrWhiteSpace($leaf)) { return 'A matching file/folder event was detected.' }
         return ('A matching file event was detected: {0}' -f $leaf)
     }
